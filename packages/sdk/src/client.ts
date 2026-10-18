@@ -26,6 +26,17 @@ import type {
   CursorRequestOptions,
   ActivityPage,
   ActivityPageOptions,
+  Proposal,
+  ProposalStatus,
+  ListProposalsParams,
+  MarketplaceSearchResponse,
+  MarketplaceSearchResult,
+  MarketplaceSearchParams,
+  CapabilityFilter,
+} from "./types.js";
+import {
+  PROPOSAL_STATUSES,
+  isValidProposalStatus,
 } from "./types.js";
 import {
   AsyncPaginationIterator,
@@ -36,6 +47,7 @@ import {
 } from "./pagination.js";
 import {
   TalosAPIError,
+  TalosTransportError,
   TalosPaymentError,
   classifyTransportError,
   errorFromResponse,
@@ -68,6 +80,16 @@ import {
 // Legacy import path: `import { TalosAPIError } from "./client.js"`.
 export { TalosAPIError };
 export { generateIdempotencyKey, validateIdempotencyKey, IdempotencyConflictError };
+export type {
+  Proposal,
+  ProposalStatus,
+  ListProposalsParams,
+  MarketplaceSearchResponse,
+  MarketplaceSearchResult,
+  MarketplaceSearchParams,
+  CapabilityFilter,
+};
+export { PROPOSAL_STATUSES, isValidProposalStatus };
 
 /**
  * Status-code driven retry policy (Retry-After aware). Enabled by default
@@ -174,12 +196,6 @@ export interface TalosClientOptions {
   /** Opt-in request signer. Omitting it preserves the legacy wire format. */
   signer?: RequestSigner;
   signing?: SigningControllerOptions;
-  /** Fetch implementation override for tests, middleware, and Node runtimes. */
-  fetch?: typeof globalThis.fetch;
-  retryPolicy?: RetryPolicyOptions;
-  timeoutMs?: number;
-  onError?: (event: TalosErrorEvent) => void;
-  chaosInjector?: ChaosInjector;
 }
 
 /**
@@ -481,11 +497,6 @@ export class TalosClient {
   private readonly fetchOverride?: typeof fetch;
   private readonly chaosInjector?: ChaosInjector;
   private signer?: SigningController;
-  private readonly fetchOverride?: typeof globalThis.fetch;
-  private readonly retryPolicy: Required<RetryOptions>;
-  private readonly timeoutMs?: number;
-  private readonly onError?: (event: TalosErrorEvent) => void;
-  private readonly chaosInjector?: ChaosInjector;
 
   constructor(options: TalosClientOptions = {}) {
     // An explicit `retry` config without `retryPolicy` opts out of the
@@ -505,10 +516,6 @@ export class TalosClient {
       options.baseUrl ?? "https://talos-stellar.vercel.app"
     ).replace(/\/$/, "");
     this.headers = { "Content-Type": "application/json" };
-    this.fetchOverride = options.fetch;
-    this.timeoutMs = options.timeoutMs;
-    this.onError = options.onError;
-    this.chaosInjector = options.chaosInjector;
     if (options.apiKey) {
       this.headers["Authorization"] = `Bearer ${options.apiKey}`;
     }
@@ -1480,4 +1487,70 @@ export class TalosClient {
       timeoutMs: options?.timeoutMs,
     });
   }
+
+  // ── Governance Proposals ───────────────────────────────────
+
+  /**
+   * List governance proposals across all Talos agents, newest first.
+   *
+   * Validates `status` client-side against documented values (`pending`, `approved`, `rejected`)
+   * and throws a `RangeError` before sending the request if invalid.
+   */
+  async listProposals(
+    params?: ListProposalsParams,
+    options?: ReadOptions,
+  ): Promise<Proposal[]> {
+    if (params?.status !== undefined && !isValidProposalStatus(params.status)) {
+      throw new RangeError(
+        `Invalid proposal status "${params.status}". Documented values are: ${PROPOSAL_STATUSES.join(", ")}`,
+      );
+    }
+
+    const { signal: paramSignal, timeoutMs: paramTimeout, ...queryRest } = params ?? {};
+    const signal = options?.signal ?? paramSignal;
+    const timeoutMs = options?.timeoutMs ?? paramTimeout;
+
+    const query: RequestParams = {};
+    if (queryRest.status !== undefined) query.status = queryRest.status;
+    if (queryRest.limit !== undefined) query.limit = queryRest.limit;
+
+    return this.request<Proposal[]>("/api/proposals", {
+      params: Object.keys(query).length > 0 ? query : undefined,
+      signal,
+      timeoutMs,
+    });
+  }
+
+  // ── Marketplace ────────────────────────────────────────────
+
+  /**
+   * Search marketplace items and filter by capabilities.
+   *
+   * Formats `capabilities` as JSON-encoded array matching `/api/marketplace/search` query contract.
+   */
+  async searchMarketplace(
+    params?: MarketplaceSearchParams,
+    options?: ReadOptions,
+  ): Promise<MarketplaceSearchResponse> {
+    const { signal: paramSignal, timeoutMs: paramTimeout, ...queryRest } = params ?? {};
+    const signal = options?.signal ?? paramSignal;
+    const timeoutMs = options?.timeoutMs ?? paramTimeout;
+
+    const query: RequestParams = {};
+    if (queryRest.q !== undefined) query.q = queryRest.q;
+    if (queryRest.capabilities !== undefined) {
+      query.capabilities = Array.isArray(queryRest.capabilities)
+        ? JSON.stringify(queryRest.capabilities)
+        : String(queryRest.capabilities);
+    }
+    if (queryRest.limit !== undefined) query.limit = queryRest.limit;
+    if (queryRest.page !== undefined) query.page = queryRest.page;
+
+    return this.request<MarketplaceSearchResponse>("/api/marketplace/search", {
+      params: Object.keys(query).length > 0 ? query : undefined,
+      signal,
+      timeoutMs,
+    });
+  }
 }
+

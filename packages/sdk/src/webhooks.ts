@@ -97,13 +97,6 @@ export interface VerifyWebhookOptions {
   replayStore?: ReplayStore;
   /** The event ID from the payload, required if replayStore is used. */
   eventId?: string;
-  /**
-   * How long (in seconds) to remember processed event IDs in the replay store.
-   * Defaults to `toleranceSeconds + 60` when toleranceSeconds > 0, or 86400
-   * (24 hours) when tolerance is disabled. Must be a positive integer if provided.
-   * Explicit values override the default TTL computation.
-   */
-  replayWindowSeconds?: number;
   /** Optional logger for observability (privacy-safe: does not log payloads or secrets). */
   logger?: Logger;
   /** Optional chaos injector for fault injection during verification. */
@@ -339,7 +332,6 @@ export class TalosWebhook {
       replayWindowSeconds,
       replayStore,
       eventId,
-      replayWindowSeconds,
       logger,
       chaosInjector,
     } = options;
@@ -366,8 +358,9 @@ export class TalosWebhook {
           "Webhook verification misconfigured: replayWindowSeconds is shorter than toleranceSeconds",
           { replayWindowSeconds, toleranceSeconds },
         );
+        const detail = replayWindowSeconds <= 0 ? "must be a positive integer and " : "";
         throw new TalosWebhookError(
-          `replayWindowSeconds (${replayWindowSeconds}) must be >= toleranceSeconds (${toleranceSeconds}) to prevent replay attacks after dedup entry expiry`,
+          `replayWindowSeconds (${replayWindowSeconds}) ${detail}must be >= toleranceSeconds (${toleranceSeconds}) to prevent replay attacks after dedup entry expiry`,
           "REPLAY_MISCONFIGURED",
         );
       }
