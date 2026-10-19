@@ -1025,6 +1025,20 @@ export class TalosClient {
     return this.request("/api/talos/me", { signal: options?.signal, timeoutMs: options?.timeoutMs });
   }
 
+  /**
+   * Check whether an agent name is available for registration.
+   */
+  async checkNameAvailability(
+    name: string,
+    options?: ReadOptions,
+  ): Promise<{ available: boolean; reason?: string }> {
+    return this.request("/api/talos/check-name", {
+      params: { name },
+      signal: options?.signal,
+      timeoutMs: options?.timeoutMs,
+    });
+  }
+
   async createTalos(params: CreateTalosParams): Promise<TalosCreated> {
     return this.request("/api/talos", {
       method: "POST",
@@ -1409,6 +1423,22 @@ export class TalosClient {
 
   async getJobResult(jobId: string, options?: ReadOptions): Promise<CommerceJob> {
     return this.request(`/api/jobs/${jobId}/result`, { signal: options?.signal, timeoutMs: options?.timeoutMs });
+  }
+
+  /**
+   * Get the on-chain payment finality status for a commerce job.
+   *
+    * @throws `TalosNotFoundError` when the job does not belong to `talosId` or does not exist.
+   */
+  async getJobPaymentStatus(
+    talosId: string,
+    jobId: string,
+    options?: ReadOptions,
+  ): Promise<JobPaymentStatus> {
+    return this.request(
+      `/api/talos/${encodeURIComponent(talosId)}/jobs/${encodeURIComponent(jobId)}/payment-status`,
+      { signal: options?.signal, timeoutMs: options?.timeoutMs },
+    );
   }
 
   // ── Leaderboard ────────────────────────────────────────────

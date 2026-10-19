@@ -12,6 +12,7 @@ export type {
   ResolvedRetryPolicy,
   ResolvedRetryOptions,
   TalosErrorEvent,
+  ReadOptions,
   WriteOptions,
   ReadOptions,
 } from "./client.js";
@@ -271,3 +272,12 @@ export {
   GENERATED_TYPES_PACKAGE,
 } from "./provenance.js";
 export type { GeneratedTypesProvenance } from "./provenance.js";
+
+// ── Drift detection ──────────────────────────────────────────────────────────
+export { DriftDetector, DriftError } from "./drift.js";
+export type {
+  DriftMode,
+  UnknownFieldPolicy,
+  DriftViolation,
+  DriftDetectorOptions,
+} from "./drift.js";
