@@ -13,7 +13,7 @@
 extern crate std;
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, String, Symbol, Vec,
+    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, IntoVal, String, Symbol, Vec,
 };
 use ttl_manager;
 use pause_control;
@@ -61,6 +61,22 @@ pub struct Proposal {
     pub created_at: u64,
 }
 
+/// Default number of ledgers prior to proposal creation at which voting power is snapshotted.
+///
+/// An offset is used so that voting power is evaluated at a ledger sequence before
+/// the proposal was submitted. This prevents flash-loan or same-ledger front-running
+/// attacks where an account acquires tokens in the same ledger as proposal creation,
+/// exercises proposal creation / voting rights with temporarily borrowed funds, and
+/// exits in the same transaction or block. On Stellar's ~5-second ledger cadence,
+/// 10 ledgers represents an offset of approximately 50 seconds.
+pub const DEFAULT_SNAPSHOT_OFFSET_LEDGERS: u32 = 10;
+
+/// Maximum allowed snapshot offset in ledgers (~7 days on a 5-second ledger cadence).
+///
+/// Bounding the maximum offset prevents misconfigurations where proposals attempt to
+/// snapshot state beyond the ledger retention or historical checkpoint window.
+pub const MAX_SNAPSHOT_OFFSET_LEDGERS: u32 = 120_960;
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GovernanceConfig {
@@ -68,6 +84,7 @@ pub struct GovernanceConfig {
     pub consensus_threshold: i128,
     pub voting_period_ledgers: u32,
     pub pulse_token_address: Address,
+    pub snapshot_offset_ledgers: Option<u32>,
 }
 
 #[contracttype]
@@ -92,6 +109,8 @@ pub enum DataKey {
     /// threshold.  Presence (value `true`) prevents re-emitting
     /// `EventQuorumReached` for subsequent votes.
     QuorumReached(u32),
+    /// Configured TalosRegistry contract address.
+    RegistryContract,
 }
 
 #[contracttype]
@@ -100,6 +119,14 @@ pub struct Checkpoint {
     pub ledger: u32,
     pub votes: i128,
 }
+
+// ── Proposal Limits ──────────────────────────────────────────────────
+
+/// Maximum allowed byte length for proposal titles.
+pub const MAX_TITLE_LEN: u32 = 128;
+
+/// Maximum allowed byte length for proposal descriptions.
+pub const MAX_DESCRIPTION_LEN: u32 = 2048;
 
 // ── Dividend Snapshot (#598) ─────────────────────────────────────────
 
@@ -396,6 +423,69 @@ pub fn version_supports(actual: (u32, u32, u32), required: (u32, u32, u32)) -> b
     actual.2 >= required.2
 }
 
+/// Expected `INTERFACE_ID` of the configured `RegistryContract`, mirroring
+/// the bytes published by `talos_registry::INTERFACE_ID` (namespace
+/// `"TalosRegistry"`, version `(1, 4, 0)`). Kept as an inline copy rather
+/// than a crate dependency so this contract's ABI check has no build-time
+/// coupling to the Registry crate.
+pub const EXPECTED_REGISTRY_INTERFACE_ID: [u8; 32] = [
+    0x54, 0x61, 0x6C, 0x6F, 0x73, 0x52, 0x65, 0x67, // "TalosReg"
+    0x69, 0x73, 0x74, 0x72, 0x79, 0x00, 0x00, 0x00, // "istry" + zero pads
+    // (major, minor, patch) big-endian u32s
+    0x00, 0x00, 0x00, 0x01, // major = 1
+    0x00, 0x00, 0x00, 0x04, // minor = 4
+    0x00, 0x00, 0x00, 0x00, // patch = 0
+    // reserved
+    0x00, 0x00, 0x00, 0x00,
+];
+
+/// Cross-contract compatibility helper.
+///
+/// Verifies that a contract registered as a `TalosRegistry` actually
+/// publishes the expected `INTERFACE_ID`. Emits a `compat_ok` event
+/// when the check passes and a `compat_err` event when it fails.
+pub fn check_registry_compatible(
+    e: &Env,
+    registry: &Address,
+    revert_on_mismatch: bool,
+) -> bool {
+    let registry_id: BytesN<32> = e.invoke_contract(
+        registry,
+        &Symbol::new(e, "interface_id"),
+        soroban_sdk::vec![e],
+    );
+
+    if registry_id != BytesN::from_array(e, &EXPECTED_REGISTRY_INTERFACE_ID) {
+        let topics = (Symbol::new(e, "compat_err"),);
+        e.events().publish(topics, ());
+        if revert_on_mismatch {
+            panic!("Registry interface ID mismatch: expected TalosRegistry-compatible v1");
+        }
+        return false;
+    }
+
+    let version: (u32, u32, u32) = e.invoke_contract(
+        registry,
+        &Symbol::new(e, "version"),
+        soroban_sdk::vec![e],
+    );
+
+    if !version_supports(version, (1, 1, 0)) {
+        let topics = (Symbol::new(e, "compat_err"),);
+        e.events()
+            .publish(topics, (version.0, version.1, version.2));
+        if revert_on_mismatch {
+            panic!("Registry version too old: requires TalosRegistry >= 1.1.0");
+        }
+        return false;
+    }
+
+    let topics = (symbol_short!("compat_ok"),);
+    e.events()
+        .publish(topics, (version.0, version.1, version.2));
+    true
+}
+
 #[contract]
 pub struct TalosGovernance;
 
@@ -429,6 +519,7 @@ impl TalosGovernance {
             consensus_threshold,
             voting_period_ledgers,
             pulse_token_address,
+            snapshot_offset_ledgers: None,
         };
 
         env.storage().persistent().set(&DataKey::Admin, &admin);
@@ -455,13 +546,41 @@ impl TalosGovernance {
         if title.len() == 0 {
             panic!("Title cannot be empty");
         }
+        if title.len() > MAX_TITLE_LEN {
+            panic!("Title exceeds maximum length");
+        }
         if description.len() == 0 {
             panic!("Description cannot be empty");
+        }
+        if description.len() > MAX_DESCRIPTION_LEN {
+            panic!("Description exceeds maximum length");
+        }
+
+        // Cross-contract verification: ensure talos_id exists and is active if
+        // a registry contract has been configured.
+        // For registry-unset deployments, the check is explicitly skipped to preserve
+        // backwards compatibility with unconfigured or legacy deployments.
+        if let Some(registry) = env
+            .storage()
+            .persistent()
+            .get::<_, Address>(&DataKey::RegistryContract)
+        {
+            let is_active: bool = env.invoke_contract(
+                &registry,
+                &Symbol::new(&env, "is_active"),
+                soroban_sdk::vec![&env, talos_id.into_val(&env)],
+            );
+            if !is_active {
+                panic!("Talos is not active or does not exist");
+            }
         }
 
         let config = Self::require_config(&env);
         let current_ledger = env.ledger().sequence();
-        let snapshot_ledger = current_ledger.saturating_sub(10);
+        let snapshot_offset = config
+            .snapshot_offset_ledgers
+            .unwrap_or(DEFAULT_SNAPSHOT_OFFSET_LEDGERS);
+        let snapshot_ledger = current_ledger.saturating_sub(snapshot_offset);
         let proposal_id = Self::next_proposal_id(env.clone());
         let end_ledger = current_ledger + config.voting_period_ledgers;
 
@@ -612,7 +731,48 @@ impl TalosGovernance {
         if config.voting_period_ledgers == 0 {
             panic!("Voting period must be positive");
         }
+        if let Some(offset) = config.snapshot_offset_ledgers {
+            if offset > MAX_SNAPSHOT_OFFSET_LEDGERS {
+                panic!("Snapshot offset exceeds maximum allowed");
+            }
+        }
         env.storage().persistent().set(&DataKey::Config, &config);
+    }
+
+    /// Update the registered TalosRegistry contract address (admin only).
+    ///
+    /// Requires admin authorization. Setting this address enables Talos ID
+    /// validation during `create_proposal`.
+    pub fn set_registry_contract(env: Env, admin: Address, registry: Address) {
+        pause_control::check_not_paused(&env, PAUSE_GOVERNANCE_CONFIG);
+        Self::require_admin(&env, &admin);
+
+        let old_registry = env
+            .storage()
+            .persistent()
+            .get::<_, Address>(&DataKey::RegistryContract);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::RegistryContract, &registry);
+
+        emit_registry_updated(&env, old_registry, registry);
+    }
+
+    /// Alias for `set_registry_contract` (admin only).
+    pub fn set_registry(env: Env, admin: Address, registry: Address) {
+        Self::set_registry_contract(env, admin, registry);
+    }
+
+    /// Verify that the configured `RegistryContract` exposes the
+    /// `TalosRegistry` interface and supports version `(1, 1, 0)` or higher.
+    pub fn assert_registry_compatible(env: Env) -> bool {
+        let registry: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RegistryContract)
+            .expect("Registry contract not initialized");
+        check_registry_compatible(&env, &registry, true)
     }
 
     // ── Dividend Snapshots (#598) ─────────────────────────────────────
@@ -1957,6 +2117,7 @@ mod tests {
             consensus_threshold: 6_000,
             voting_period_ledgers: 30,
             pulse_token_address: pulse,
+            snapshot_offset_ledgers: None,
         };
 
         client
@@ -2065,6 +2226,7 @@ mod tests {
             consensus_threshold: 6_000,
             voting_period_ledgers: 30,
             pulse_token_address: pulse,
+            snapshot_offset_ledgers: None,
         };
         let res = client
             .mock_auths(&[MockAuth {
@@ -2264,6 +2426,7 @@ mod tests {
             consensus_threshold: 5_000,
             voting_period_ledgers: 20,
             pulse_token_address: pulse,
+            snapshot_offset_ledgers: None,
         };
         let rando = Address::generate(&env);
         let result = client.try_update_config(&rando, &config);
@@ -2448,6 +2611,98 @@ mod tests {
             }])
             .try_create_proposal(&proposer, &1u32, &s(&env, "title"), &s(&env, ""));
         assert!(result.is_err(), "empty description must be rejected");
+    }
+
+    /// Proposal creation with title exactly at MAX_TITLE_LEN succeeds.
+    #[test]
+    fn create_proposal_title_at_limit_succeeds() {
+        let (env, contract_id, _admin, _pulse, client) = setup();
+        let proposer = Address::generate(&env);
+        let title_bytes = [b'a'; MAX_TITLE_LEN as usize];
+        let title = s(&env, std::str::from_utf8(&title_bytes).unwrap());
+        let desc = s(&env, "Valid description");
+
+        let proposal_id = client
+            .mock_auths(&[MockAuth {
+                address: &proposer,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "create_proposal",
+                    args: (proposer.clone(), 1u32, title.clone(), desc.clone()).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .create_proposal(&proposer, &1u32, &title, &desc);
+        assert_eq!(proposal_id, 1);
+    }
+
+    /// Proposal creation with title one byte over MAX_TITLE_LEN fails.
+    #[test]
+    fn create_proposal_title_exceeding_limit_fails() {
+        let (env, contract_id, _admin, _pulse, client) = setup();
+        let proposer = Address::generate(&env);
+        let title_bytes = [b'a'; (MAX_TITLE_LEN + 1) as usize];
+        let title = s(&env, std::str::from_utf8(&title_bytes).unwrap());
+        let desc = s(&env, "Valid description");
+
+        let result = client
+            .mock_auths(&[MockAuth {
+                address: &proposer,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "create_proposal",
+                    args: (proposer.clone(), 1u32, title.clone(), desc.clone()).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_create_proposal(&proposer, &1u32, &title, &desc);
+        assert!(result.is_err(), "title exceeding limit must fail");
+    }
+
+    /// Proposal creation with description exactly at MAX_DESCRIPTION_LEN succeeds.
+    #[test]
+    fn create_proposal_description_at_limit_succeeds() {
+        let (env, contract_id, _admin, _pulse, client) = setup();
+        let proposer = Address::generate(&env);
+        let title = s(&env, "Valid title");
+        let desc_bytes = [b'd'; MAX_DESCRIPTION_LEN as usize];
+        let desc = s(&env, std::str::from_utf8(&desc_bytes).unwrap());
+
+        let proposal_id = client
+            .mock_auths(&[MockAuth {
+                address: &proposer,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "create_proposal",
+                    args: (proposer.clone(), 1u32, title.clone(), desc.clone()).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .create_proposal(&proposer, &1u32, &title, &desc);
+        assert_eq!(proposal_id, 1);
+    }
+
+    /// Proposal creation with description one byte over MAX_DESCRIPTION_LEN fails.
+    #[test]
+    fn create_proposal_description_exceeding_limit_fails() {
+        let (env, contract_id, _admin, _pulse, client) = setup();
+        let proposer = Address::generate(&env);
+        let title = s(&env, "Valid title");
+        let desc_bytes = [b'd'; (MAX_DESCRIPTION_LEN + 1) as usize];
+        let desc = s(&env, std::str::from_utf8(&desc_bytes).unwrap());
+
+        let result = client
+            .mock_auths(&[MockAuth {
+                address: &proposer,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "create_proposal",
+                    args: (proposer.clone(), 1u32, title.clone(), desc.clone()).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_create_proposal(&proposer, &1u32, &title, &desc);
+        assert!(result.is_err(), "description exceeding limit must fail");
     }
 
     /// cache_token_balance with a negative balance must fail.
