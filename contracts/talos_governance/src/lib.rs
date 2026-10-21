@@ -32,6 +32,7 @@ pub enum ProposalStatus {
     Approved,
     Rejected,
     Executed,
+    Cancelled,
 }
 
 #[contracttype]
@@ -111,6 +112,8 @@ pub enum DataKey {
     QuorumReached(u32),
     /// Configured TalosRegistry contract address.
     RegistryContract,
+    /// Pending admin proposed for a two-step transfer (#948).
+    PendingAdmin,
 }
 
 #[contracttype]
@@ -575,6 +578,24 @@ impl TalosGovernance {
             }
         }
 
+        // Validate talos_id if a registry contract is configured.
+        // For registry-unset deployments, the check is explicitly skipped to preserve
+        // backwards compatibility with unconfigured or legacy deployments.
+        if let Some(registry) = env
+            .storage()
+            .persistent()
+            .get::<_, Address>(&DataKey::RegistryContract)
+        {
+            let is_active: bool = env.invoke_contract(
+                &registry,
+                &Symbol::new(&env, "is_active"),
+                soroban_sdk::vec![&env, talos_id.into_val(&env)],
+            );
+            if !is_active {
+                panic!("Talos is not active or does not exist");
+            }
+        }
+
         let config = Self::require_config(&env);
         let current_ledger = env.ledger().sequence();
         let snapshot_offset = config
@@ -609,6 +630,32 @@ impl TalosGovernance {
 
         emit_proposal_created(&env, proposal_id, talos_id, proposer, snapshot_ledger, end_ledger);
         proposal_id
+    }
+
+    pub fn cancel_proposal(env: Env, proposer: Address, proposal_id: u32) {
+        proposer.require_auth();
+
+        let mut proposal: Proposal = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Proposal(proposal_id))
+            .expect("Proposal not found");
+
+        if proposal.proposer != proposer {
+            panic!("Only the proposer can cancel this proposal");
+        }
+        if proposal.status != ProposalStatus::Active {
+            panic!("Only active proposals can be cancelled");
+        }
+        if proposal.total_voters > 0 {
+            panic!("Cannot cancel a proposal that has already received votes");
+        }
+
+        proposal.status = ProposalStatus::Cancelled;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Proposal(proposal_id), &proposal);
+        emit_proposal_status_changed(&env, proposal_id, ProposalStatus::Cancelled);
     }
 
     pub fn vote(env: Env, voter: Address, proposal_id: u32, choice: VoteChoice) {
@@ -3959,5 +4006,381 @@ mod tests {
             .pause_domain(&PAUSE_PROPOSAL_CREATION, &0);
         let status = client.get_domain_pause_status(&PAUSE_PROPOSAL_CREATION).unwrap();
         assert!(status.paused);
+    }
+
+    // ── Two-step admin transfer tests (#948) ──────────────────────────
+    // Mirrored from the registry's admin-transfer tests.
+
+    fn mock_propose(
+        env: &Env,
+        client: &TalosGovernanceClient<'static>,
+        contract_id: &Address,
+        admin: &Address,
+        new_admin: &Address,
+    ) {
+        client
+            .mock_auths(&[MockAuth {
+                address: admin,
+                invoke: &MockAuthInvoke {
+                    contract: contract_id,
+                    fn_name: "propose_admin",
+                    args: (admin.clone(), new_admin.clone()).into_val(env),
+                    sub_invokes: &[],
+                },
+            }])
+            .propose_admin(admin, new_admin);
+    }
+
+    fn mock_accept(
+        env: &Env,
+        client: &TalosGovernanceClient<'static>,
+        contract_id: &Address,
+        pending: &Address,
+    ) {
+        client
+            .mock_auths(&[MockAuth {
+                address: pending,
+                invoke: &MockAuthInvoke {
+                    contract: contract_id,
+                    fn_name: "accept_admin",
+                    args: ().into_val(env),
+                    sub_invokes: &[],
+                },
+            }])
+            .accept_admin();
+    }
+
+    fn mock_cancel(
+        env: &Env,
+        client: &TalosGovernanceClient<'static>,
+        contract_id: &Address,
+        admin: &Address,
+    ) {
+        client
+            .mock_auths(&[MockAuth {
+                address: admin,
+                invoke: &MockAuthInvoke {
+                    contract: contract_id,
+                    fn_name: "cancel_admin_transfer",
+                    args: (admin.clone(),).into_val(env),
+                    sub_invokes: &[],
+                },
+            }])
+            .cancel_admin_transfer(admin);
+    }
+
+    #[test]
+    fn propose_then_accept_transfers_admin() {
+        let (env, contract_id, admin, _pulse, client) = setup();
+        let new_admin = Address::generate(&env);
+
+        assert_eq!(client.get_admin(), Some(admin.clone()));
+        assert_eq!(client.get_pending_admin(), None);
+
+        mock_propose(&env, &client, &contract_id, &admin, &new_admin);
+        assert_eq!(client.get_pending_admin(), Some(new_admin.clone()));
+
+        mock_accept(&env, &client, &contract_id, &new_admin);
+
+        // Admin is now new_admin; pending slot is cleared.
+        assert_eq!(client.get_admin(), Some(new_admin.clone()));
+        assert_eq!(client.get_pending_admin(), None);
+    }
+
+    #[test]
+    fn propose_admin_replaces_existing_pending() {
+        let (env, contract_id, admin, _pulse, client) = setup();
+        let first = Address::generate(&env);
+        let second = Address::generate(&env);
+
+        mock_propose(&env, &client, &contract_id, &admin, &first);
+        assert_eq!(client.get_pending_admin(), Some(first.clone()));
+
+        mock_propose(&env, &client, &contract_id, &admin, &second);
+        assert_eq!(client.get_pending_admin(), Some(second.clone()));
+
+        // First nominee can no longer accept.
+        let result = client
+            .mock_auths(&[MockAuth {
+                address: &first,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "accept_admin",
+                    args: ().into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_accept_admin();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn old_admin_loses_rights_after_transfer() {
+        let (env, contract_id, admin, pulse, client) = setup();
+        let new_admin = Address::generate(&env);
+
+        mock_propose(&env, &client, &contract_id, &admin, &new_admin);
+        mock_accept(&env, &client, &contract_id, &new_admin);
+
+        // Old admin can no longer update config...
+        let config = GovernanceConfig {
+            quorum_threshold: 100_i128,
+            consensus_threshold: 5_100_i128,
+            voting_period_ledgers: 20_u32,
+            pulse_token_address: pulse.clone(),
+            snapshot_offset_ledgers: Some(10),
+        };
+        let result = client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "update_config",
+                    args: (admin.clone(), config.clone()).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_update_config(&admin, &config);
+        assert!(result.is_err());
+
+        // ...but the new admin can.
+        client
+            .mock_auths(&[MockAuth {
+                address: &new_admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "update_config",
+                    args: (new_admin.clone(), config.clone()).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .update_config(&new_admin, &config);
+    }
+
+    #[test]
+    fn propose_admin_requires_current_admin_auth() {
+        let (env, contract_id, admin, _pulse, client) = setup();
+        let impostor = Address::generate(&env);
+        let new_admin = Address::generate(&env);
+
+        // No mock_auths → auth check fails.
+        assert!(client.try_propose_admin(&admin, &new_admin).is_err());
+
+        // Impostor auth → still fails.
+        let result = client
+            .mock_auths(&[MockAuth {
+                address: &impostor,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "propose_admin",
+                    args: (impostor.clone(), new_admin.clone()).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_propose_admin(&impostor, &new_admin);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn accept_admin_requires_pending_admin_auth() {
+        let (env, contract_id, admin, _pulse, client) = setup();
+        let new_admin = Address::generate(&env);
+        let impostor = Address::generate(&env);
+
+        mock_propose(&env, &client, &contract_id, &admin, &new_admin);
+
+        // Impostor pretending to be pending admin.
+        let result = client
+            .mock_auths(&[MockAuth {
+                address: &impostor,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "accept_admin",
+                    args: ().into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_accept_admin();
+        assert!(result.is_err());
+
+        // Original admin trying to accept — must also fail (only pending may accept).
+        let result2 = client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "accept_admin",
+                    args: ().into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_accept_admin();
+        assert!(result2.is_err());
+    }
+
+    #[test]
+    fn accept_admin_without_pending_panics() {
+        let (_env, _contract_id, _admin, _pulse, client) = setup();
+
+        // No nomination exists.
+        assert!(client.try_accept_admin().is_err());
+    }
+
+    #[test]
+    fn cancel_admin_transfer_clears_pending() {
+        let (env, contract_id, admin, _pulse, client) = setup();
+        let new_admin = Address::generate(&env);
+
+        mock_propose(&env, &client, &contract_id, &admin, &new_admin);
+        assert_eq!(client.get_pending_admin(), Some(new_admin.clone()));
+
+        mock_cancel(&env, &client, &contract_id, &admin);
+
+        assert_eq!(client.get_pending_admin(), None);
+        // Admin is unchanged.
+        assert_eq!(client.get_admin(), Some(admin.clone()));
+    }
+
+    #[test]
+    fn cancelled_pending_cannot_accept() {
+        let (env, contract_id, admin, _pulse, client) = setup();
+        let new_admin = Address::generate(&env);
+
+        mock_propose(&env, &client, &contract_id, &admin, &new_admin);
+        mock_cancel(&env, &client, &contract_id, &admin);
+
+        let result = client
+            .mock_auths(&[MockAuth {
+                address: &new_admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "accept_admin",
+                    args: ().into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_accept_admin();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cancel_without_pending_panics() {
+        let (env, _contract_id, admin, _pulse, client) = setup();
+
+        // No nomination exists.
+        assert!(client.try_cancel_admin_transfer(&admin).is_err());
+    }
+
+    #[test]
+    fn cancel_admin_transfer_requires_admin_auth() {
+        let (env, contract_id, admin, _pulse, client) = setup();
+        let new_admin = Address::generate(&env);
+        let impostor = Address::generate(&env);
+
+        mock_propose(&env, &client, &contract_id, &admin, &new_admin);
+
+        let result = client
+            .mock_auths(&[MockAuth {
+                address: &impostor,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "cancel_admin_transfer",
+                    args: (impostor.clone(),).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_cancel_admin_transfer(&impostor);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn propose_admin_emits_adm_prp_event() {
+        let (env, contract_id, admin, _pulse, client) = setup();
+        let new_admin = Address::generate(&env);
+
+        mock_propose(&env, &client, &contract_id, &admin, &new_admin);
+
+        let events = env.events().all();
+        let propose_events: std::vec::Vec<_> = events
+            .iter()
+            .filter(|(a, t, _)| {
+                if *a != contract_id {
+                    return false;
+                }
+                if t.len() == 0 {
+                    return false;
+                }
+                let sym: Result<Symbol, _> = soroban_sdk::TryFromVal::try_from_val(&env, &t.get(0).unwrap());
+                sym.map(|s| s == symbol_short!("adm_prp")).unwrap_or(false)
+            })
+            .collect();
+        assert_eq!(propose_events.len(), 1);
+
+        let (_, _, data) = propose_events[0].clone();
+        let payload: EventAdminProposed = soroban_sdk::FromVal::from_val(&env, &data);
+        assert_eq!(payload.current_admin, admin);
+        assert_eq!(payload.pending_admin, new_admin);
+    }
+
+    #[test]
+    fn accept_admin_emits_adm_acc_event() {
+        let (env, contract_id, admin, _pulse, client) = setup();
+        let new_admin = Address::generate(&env);
+
+        mock_propose(&env, &client, &contract_id, &admin, &new_admin);
+
+        // Clear events accumulated by propose.
+        let _ = env.events().all();
+
+        mock_accept(&env, &client, &contract_id, &new_admin);
+
+        let events = env.events().all();
+        let accept_events: std::vec::Vec<_> = events
+            .iter()
+            .filter(|(a, t, _)| {
+                if *a != contract_id {
+                    return false;
+                }
+                if t.len() == 0 {
+                    return false;
+                }
+                let sym: Result<Symbol, _> = soroban_sdk::TryFromVal::try_from_val(&env, &t.get(0).unwrap());
+                sym.map(|s| s == symbol_short!("adm_acc")).unwrap_or(false)
+            })
+            .collect();
+        assert_eq!(accept_events.len(), 1);
+
+        let (_, _, data) = accept_events[0].clone();
+        let payload: EventAdminAccepted = soroban_sdk::FromVal::from_val(&env, &data);
+        assert_eq!(payload.new_admin, new_admin);
+    }
+
+    #[test]
+    fn cancel_admin_transfer_emits_adm_cnl_event() {
+        let (env, contract_id, admin, _pulse, client) = setup();
+        let new_admin = Address::generate(&env);
+
+        mock_propose(&env, &client, &contract_id, &admin, &new_admin);
+        mock_cancel(&env, &client, &contract_id, &admin);
+
+        let events = env.events().all();
+        let cancel_events: std::vec::Vec<_> = events
+            .iter()
+            .filter(|(a, t, _)| {
+                if *a != contract_id {
+                    return false;
+                }
+                t.len() != 0 && {
+                    let sym: Result<Symbol, _> =
+                        soroban_sdk::TryFromVal::try_from_val(&env, &t.get(0).unwrap());
+                    sym.map(|s| s == symbol_short!("adm_cnl")).unwrap_or(false)
+                }
+            })
+            .collect();
+        assert_eq!(cancel_events.len(), 1);
+
+        let (_, _, data) = cancel_events[0].clone();
+        let payload: EventAdminTransferCancelled = soroban_sdk::FromVal::from_val(&env, &data);
+        assert_eq!(payload.pending_admin, new_admin);
     }
 }
