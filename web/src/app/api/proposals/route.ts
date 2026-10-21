@@ -14,18 +14,6 @@ import { decodeProposalCursor, encodeProposalCursor } from "./cursor";
 // Optional paging:  ?limit=1..100 (default 50), ?cursor=<opaque nextCursor from previous page>
 // Response: { proposals, nextCursor, talos } — `talos` (id/name pairs for the
 // filter dropdown) is only included on the first page (no cursor).
-async function _GET(request: NextRequest) {
-  const searchParams = new URL(request.url).searchParams;
-  const status = searchParams.get("status");
-  const talosId = searchParams.get("talosId");
-  const type = searchParams.get("type");
-  const rawCursor = searchParams.get("cursor");
-
-  const parsedLimit = parseAnalyticsLimit(
-    searchParams.get("limit"),
-    PROPOSALS_DEFAULT_LIMIT,
-    PROPOSALS_MAX_LIMIT,
-  );
 const ALLOWED_STATUSES = ["pending", "approved", "rejected"] as const;
 type AllowedStatus = (typeof ALLOWED_STATUSES)[number];
 
@@ -45,12 +33,13 @@ function parseStatus(rawStatus: string | null):
   };
 }
 
-// GET /api/proposals — All proposals across all Talos, newest first
-// Optional ?status=pending|approved|rejected filter, optional ?limit=1..100 (default 50)
 async function _GET(request: NextRequest) {
   const searchParams = new URL(request.url).searchParams;
   const rawStatus = searchParams.get("status");
-  
+  const talosId = searchParams.get("talosId");
+  const type = searchParams.get("type");
+  const rawCursor = searchParams.get("cursor");
+
   const parsedStatus = parseStatus(rawStatus);
   if (!parsedStatus.ok) {
     return Response.json(
@@ -58,8 +47,12 @@ async function _GET(request: NextRequest) {
       { status: 400 }
     );
   }
-  
-  const parsedLimit = parseAnalyticsLimit(searchParams.get("limit"), 50, 100);
+
+  const parsedLimit = parseAnalyticsLimit(
+    searchParams.get("limit"),
+    PROPOSALS_DEFAULT_LIMIT,
+    PROPOSALS_MAX_LIMIT,
+  );
   if (!parsedLimit.ok) return parsedLimit.response;
   const limit = parsedLimit.limit;
 
@@ -123,9 +116,6 @@ async function _GET(request: NextRequest) {
       .innerJoin(tlsApprovals, eq(tlsApprovals.talosId, tlsTalos.id))
       .groupBy(tlsTalos.id, tlsTalos.name)
       .orderBy(asc(tlsTalos.name));
-      .where(parsedStatus.status ? eq(tlsApprovals.status, parsedStatus.status) : undefined)
-      .orderBy(desc(tlsApprovals.createdAt))
-      .limit(limit);
 
     return Response.json({ proposals, nextCursor, talos });
   } catch {

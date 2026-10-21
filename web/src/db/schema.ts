@@ -1084,3 +1084,5 @@ export const tlsIdempotencyKeys = pgTable(
     index("tls_idempotency_keys_expiresAt_idx").on(t.expiresAt),
   ],
 );
+
+export { tlsContractEvents, tlsEventCursor } from "../../drizzle/schema";
